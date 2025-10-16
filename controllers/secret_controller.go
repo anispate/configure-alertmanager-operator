@@ -36,6 +36,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 
 	"github.com/openshift/configure-alertmanager-operator/config"
+	"github.com/openshift/configure-alertmanager-operator/pkg/clustertype"
 	"github.com/openshift/configure-alertmanager-operator/pkg/metrics"
 	"github.com/openshift/configure-alertmanager-operator/pkg/readiness"
 	alertmanager "github.com/openshift/configure-alertmanager-operator/pkg/types"
@@ -223,6 +224,15 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		reqLogger.Error(err, "Error reading cluster id.")
 	}
 
+	// Detect cluster type
+	clusterTypeDetector := clustertype.NewDetector(r.Client)
+	clusterType, err := clusterTypeDetector.GetClusterType(context.TODO())
+	if err != nil {
+		reqLogger.Error(err, "Error detecting cluster type, defaulting to unknown")
+		clusterType = clustertype.Unknown
+	}
+	reqLogger.Info("Detected cluster type", "clusterType", clusterType)
+
 	alertmanagerconfig := createAlertManagerConfig(reqLogger,
 		pagerdutyRoutingKey,
 		goalertURLlow,
@@ -232,7 +242,8 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		ocmAgentURL,
 		clusterID,
 		clusterProxy,
-		osdNamespaces)
+		osdNamespaces,
+		clusterType)
 
 	// write the alertmanager Config
 	writeAlertManagerConfig(r, reqLogger, alertmanagerconfig)
@@ -258,7 +269,7 @@ func (r *SecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func createSubroutes(namespaceList []string, receiver receiverType) *alertmanager.Route {
+func createSubroutes(namespaceList []string, receiver receiverType, clType clustertype.ClusterType) *alertmanager.Route {
 
 	var receiverCommon, receiverCritical, receiverError, receiverWarning, receiverDefault string
 
@@ -293,6 +304,21 @@ func createSubroutes(namespaceList []string, receiver receiverType) *alertmanage
 		// {Receiver: receiverNull, Match: map[string]string{"alertname": "SnitchHeartBeat", "severity": "deadman"}},
 		// Needed to drop GoAlert heartbeat alerts
 		{Receiver: receiverNull, Match: map[string]string{"alertname": "Watchdog", "severity": "none"}},
+		// Silence MC-only alerts on non-management clusters
+		// Dynatrace alerts should only page on Management Clusters
+		// https://issues.redhat.com/browse/OSD-XXXXX (replace with your ticket number)
+	}
+
+	// Add MC-only alert suppression for non-management clusters
+	if clType != clustertype.ManagementCluster {
+		subroute = append(subroute,
+			&alertmanager.Route{Receiver: receiverNull, Match: map[string]string{"alertname": "DynatraceOperatorDegradedSRE", "namespace": "dynatrace"}},
+			&alertmanager.Route{Receiver: receiverNull, Match: map[string]string{"alertname": "DynatraceDynakubeComponentsDegradedSRE", "namespace": "dynatrace"}},
+		)
+	}
+
+	// Continue with existing routes
+	subroute = append(subroute, []*alertmanager.Route{
 		// https://issues.redhat.com/browse/OSD-11298
 		// indications that master nodes have been terminated should be critical
 		// regex tests: https://regex101.com/r/Rn6F5A/1
@@ -452,7 +478,7 @@ func createSubroutes(namespaceList []string, receiver receiverType) *alertmanage
 		// Route etcdExcessiveDatabaseGrowth warning level alerts to SRE as critical to aid in reducing incidents related
 		// to customers exceeding etcd's max database size.
 		{Receiver: receiverCritical, Match: map[string]string{"alertname": "etcdExcessiveDatabaseGrowth"}},
-	}
+	}...)
 
 	if !config.IsFedramp() {
 		// Route ClusterOperatorDown for monitoring to null receiver https://issues.redhat.com/browse/OSD-19769
@@ -691,7 +717,7 @@ func createHttpConfig(clusterProxy string) alertmanager.HttpConfig {
 }
 
 // createAlertManagerConfig creates an AlertManager Config in memory based on the provided input parameters.
-func createAlertManagerConfig(reqLogger logr.Logger, pagerdutyRoutingKey, goalertURLlow, goalertURLhigh, goalertURLheartbeat, watchdogURL, ocmAgentURL, clusterID string, clusterProxy string, namespaceList []string) *alertmanager.Config {
+func createAlertManagerConfig(reqLogger logr.Logger, pagerdutyRoutingKey, goalertURLlow, goalertURLhigh, goalertURLheartbeat, watchdogURL, ocmAgentURL, clusterID string, clusterProxy string, namespaceList []string, clType clustertype.ClusterType) *alertmanager.Config {
 	routes := []*alertmanager.Route{}
 	receivers := []*alertmanager.Receiver{}
 
@@ -708,13 +734,13 @@ func createAlertManagerConfig(reqLogger logr.Logger, pagerdutyRoutingKey, goaler
 
 	if pagerdutyRoutingKey != "" {
 		reqLogger.Info("INFO: Configuring a PagerDuty route and receiver")
-		routes = append(routes, createSubroutes(namespaceList, Pagerduty))
+		routes = append(routes, createSubroutes(namespaceList, Pagerduty, clType))
 		receivers = append(receivers, createPagerdutyReceivers(pagerdutyRoutingKey, clusterID, clusterProxy)...)
 	}
 
 	if goalertURLlow != "" && goalertURLhigh != "" {
 		reqLogger.Info("INFO: Configuring a GoAlert route and receiver")
-		routes = append(routes, createSubroutes(namespaceList, GoAlert))
+		routes = append(routes, createSubroutes(namespaceList, GoAlert, clType))
 		receivers = append(receivers, createGoalertReceiver(goalertURLlow, receiverGoAlertLow, clusterProxy)...)
 		receivers = append(receivers, createGoalertReceiver(goalertURLhigh, receiverGoAlertHigh, clusterProxy)...)
 	} else {
